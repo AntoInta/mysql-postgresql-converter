@@ -14,6 +14,9 @@ import os
 import time
 import subprocess
 
+# Antonio@Tembo: forza UTF-8
+reload(sys)
+sys.setdefaultencoding('UTF8')
 
 def parse(input_filename, output_filename):
     "Feed it a file, and it'll output a fixed one"
@@ -71,21 +74,28 @@ def parse(input_filename, output_filename):
         logging.flush()
         line = line.decode("utf8").strip().replace(r"\\", "WUBWUBREALSLASHWUB").replace(r"\'", "''").replace("WUBWUBREALSLASHWUB", r"\\")
         # Ignore comment lines
-        if line.startswith("--") or line.startswith("/*") or line.startswith("LOCK TABLES") or line.startswith("DROP TABLE") or line.startswith("UNLOCK TABLES") or not line:
+        if line.startswith("--") or line.startswith("/*") or line.startswith("LOCK TABLES") or line.startswith("UNLOCK TABLES") or not line:
             continue
 
         # Outside of anything handling
         if current_table is None:
             # Start of a table creation statement?
             if line.startswith("CREATE TABLE"):
-                current_table = line.split('"')[1]
+                if not line.startswith("CREATE TABLE IF NOT EXISTS"):
+		    line = line.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS")
+
+		current_table = line.split('"')[1]
                 tables[current_table] = {"columns": []}
                 creation_lines = []
             # Inserting data into a table?
             elif line.startswith("INSERT INTO"):
-                output.write(line.encode("utf8").replace("'0000-00-00 00:00:00'", "NULL") + "\n")
+                output.write(line.encode("utf8").replace("'0000-00-00 00:00:00'", "NULL").replace("'0000-00-00'",'NULL') + "\n")
                 num_inserts += 1
             # ???
+	    elif line.startswith("DROP TABLE"):
+		if not line.startswith("DROP TABLE IF EXISTS"):
+                    line = line.replace("DROP TABLE", "DROP TABLE IF EXISTS")
+            	output.write(line)
             else:
                 print "\n ! Unknown line in main body: %s" % line
 
@@ -104,23 +114,25 @@ def parse(input_filename, output_filename):
                 except ValueError:
                     type = definition.strip()
                     extra = ""
+
                 extra = re.sub("CHARACTER SET [\w\d]+\s*", "", extra.replace("unsigned", ""))
                 extra = re.sub("COLLATE [\w\d]+\s*", "", extra.replace("unsigned", ""))
-
-                # See if it needs type conversion
+		extra = re.sub("COMMENT \'[a-zA-Z0-9\s]+\'", "",extra);
+                
+		# See if it needs type conversion
                 final_type = None
                 set_sequence = None
                 if type.startswith("tinyint("):
                     type = "int4"
                     set_sequence = True
                     final_type = "boolean"
-                elif type.startswith("int("):
+                elif type.startswith("int(") or type.startswith("mediumint("):
                     type = "integer"
                     set_sequence = True
                 elif type.startswith("bigint("):
                     type = "bigint"
                     set_sequence = True
-                elif type == "longtext":
+		elif type == "longtext":
                     type = "text"
                 elif type == "mediumtext":
                     type = "text"
@@ -129,13 +141,22 @@ def parse(input_filename, output_filename):
                 elif type.startswith("varchar("):
                     size = int(type.split("(")[1].rstrip(")"))
                     type = "varchar(%s)" % (size * 2)
-                elif type.startswith("smallint("):
+                elif type.startswith("varbinary("):
+		    size = int(type.split("(")[1].rstrip(")"))
+		    type = "bit(%s)" % (size * 2)
+		elif type.startswith("smallint("):
                     type = "int2"
                     set_sequence = True
-                elif type == "datetime":
+                elif type == "datetime" or type == "date":
                     type = "timestamp with time zone"
-                elif type == "double":
+		    extra = re.sub(r'(\"[0-9]{4}\-[0-9]{2}\-[0-9]{2}\")|(\"[0-9]{4}\-[0-9]{2}\-[0-9]{2}\s[0-9]{2}\:[0-9]{2}\:[0-9]{2}\")','NULL',extra.replace('\'','"'))
+                elif type == "timestamp":
+		    extra = re.sub(r'(\"[0-9]{4}\-[0-9]{2}\-[0-9]{2}\")|(\"[0-9]{4}\-[0-9]{2}\-[0-9]{2}\s[0-9]{2}\:[0-9]{2}\:[0-9]{2}\")','NULL',extra.replace('\'','"'))
+		elif type == "double":
                     type = "double precision"
+		elif type.startswith('double(') or type.startswith('float('):
+		    size = type.split("(")[1].rstrip(")")
+		    type = "numeric(%s)" % (size)	
                 elif type.endswith("blob"):
                     type = "bytea"
                 elif type.startswith("enum(") or type.startswith("set("):
@@ -148,7 +169,7 @@ def parse(input_filename, output_filename):
                     enum_name = "{0}_{1}".format(current_table, name)
 
                     if enum_name not in enum_types:
-                        output.write("CREATE TYPE {0} AS ENUM ({1}); \n".format(enum_name, types_str));
+			output.write("BEGIN; DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = LOWER('{0}')) THEN CREATE TYPE {0} AS ENUM ({1});END IF;END$$;END;\n".format(enum_name, types_str))
                         enum_types.append(enum_name)
 
                     type = enum_name
@@ -157,9 +178,9 @@ def parse(input_filename, output_filename):
                     cast_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"%s\" DROP DEFAULT, ALTER COLUMN \"%s\" TYPE %s USING CAST(\"%s\" as %s)" % (current_table, name, name, final_type, name, final_type))
                 # ID fields need sequences [if they are integers?]
                 if name == "id" and set_sequence is True:
-                    sequence_lines.append("CREATE SEQUENCE %s_id_seq" % (current_table))
-                    sequence_lines.append("SELECT setval('%s_id_seq', max(id)) FROM %s" % (current_table, current_table))
-                    sequence_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"id\" SET DEFAULT nextval('%s_id_seq')" % (current_table, current_table))
+                    sequence_lines.append("CREATE SEQUENCE \"%s_id_seq\"" % (current_table))
+                    sequence_lines.append("SELECT setval('\"%s_id_seq\"', (SELECT max(\"id\") FROM \"%s\"))" % (current_table, current_table))
+                    sequence_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"id\" SET DEFAULT nextval('\"%s_id_seq\"')" % (current_table, current_table))
                 # Record it
                 creation_lines.append('"%s" %s %s' % (name, type, extra))
                 tables[current_table]['columns'].append((name, type, extra))
